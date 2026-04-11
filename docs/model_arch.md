@@ -15,7 +15,7 @@
 - 最大位置（RoPE）：32768
 - RoPE Theta（base）：1000000
 - RMSNorm Epsilon：1e-6
-- 激活：SwiGLU（`SiluAndMul`）
+- 激活：SwiGLU
 - QKV Bias：False
 - MLP Bias：False
 - Tie Word Embeddings：True
@@ -23,18 +23,18 @@
 ## Attention Block（每层）
 
 - 输入 RMSNorm
-- QKV 投影（列并行）
+- QKV 投影
 - 当 `qkv_bias=False` 时，对 Q / K 做逐头归一化
 - 对 Q / K 施加 RoPE
 - 注意力计算（GQA，`num_heads=16`，`num_kv_heads=8`）
-- 输出投影（行并行）
+- 输出投影
 - 注意力后 RMSNorm + 残差
 
 ## MLP Block（每层）
 
-- Gate/Up 投影（合并列并行）
-- SwiGLU 激活（`SiluAndMul`）
-- Down 投影（行并行）
+- Gate/Up 投影
+- SwiGLU 激活
+- Down 投影
 
 ## 执行备注
 
