@@ -17,22 +17,20 @@ def _triton_silumul_kernel(
     output_ptr,
     n_rows,
     n_cols,
-    seq_len,
-    x_stride_b, x_stride_s, x_stride_d,
-    y_stride_b, y_stride_s, y_stride_d,
-    output_stride_b, output_stride_s, output_stride_d,
+    x_stride_t, x_stride_d,
+    y_stride_t, y_stride_d,
+    output_stride_t, output_stride_d,
     BLOCK_N: tl.constexpr,
 ):
     row_start = tl.program_id(axis=0)
     row_step = tl.num_programs(axis=0)
     
     for row_idx in tl.range(row_start, n_rows, row_step):
-        batch_idx = row_idx // seq_len
-        seq_idx = row_idx % seq_len
+        token_idx = row_idx
         
-        x_row_ptr = x_ptr + batch_idx * x_stride_b + seq_idx * x_stride_s
-        y_row_ptr = y_ptr + batch_idx * y_stride_b + seq_idx * y_stride_s
-        out_ptr = output_ptr + batch_idx * output_stride_b + seq_idx * output_stride_s
+        x_row_ptr = x_ptr + token_idx * x_stride_t
+        y_row_ptr = y_ptr + token_idx * y_stride_t
+        out_ptr = output_ptr + token_idx * output_stride_t
         
         for col_start in tl.range(0, n_cols, BLOCK_N):
             col_offsets = col_start + tl.arange(0, BLOCK_N)
@@ -85,19 +83,19 @@ def get_gpu_props():
         max_threads_per_sm=max_threads_per_sm
     )
     
-# x: [B, S, D] y: [B, S, D]
-# output: [B, S, D]
+# x: [T, D] y: [T, D]
+# output: [T, D]
 def triton_silumul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    assert x.dim() == 3, "triton_silumul only supports [B, S, D]"
-    assert y.dim() == 3, "triton_silumul only supports [B, S, D]"
+    assert x.dim() == 2, "triton_silumul only supports [T, D]"
+    assert y.dim() == 2, "triton_silumul only supports [T, D]"
     assert x.shape == y.shape, "x and y must have the same shape"
     assert x.is_cuda and y.is_cuda, "triton_silumul only supports CUDA tensors"
     assert x.device == y.device, "x and y must be on the same device"
     assert x.dtype == y.dtype, "x and y must have the same dtype"
     assert x.is_contiguous() and y.is_contiguous(), "triton_silumul expects contiguous inputs"
 
-    B, S, D = x.shape
-    n_rows = B * S
+    T, D = x.shape
+    n_rows = T
     n_cols = D
     
     num_warps = 8
@@ -109,14 +107,13 @@ def triton_silumul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     
     # kernel = _triton_silumul_kernel.warmup(
     #     x,
-    #     weight,
     #     y,
+    #     output,
     #     n_rows,
     #     n_cols,
-    #     S,
-    #     x.stride(0), x.stride(1), x.stride(2),
-    #     y.stride(0), y.stride(1), y.stride(2),
-    #     output.stride(0), output.stride(1), output.stride(2),
+    #     x.stride(0), x.stride(1),
+    #     y.stride(0), y.stride(1),
+    #     output.stride(0), output.stride(1),
     #     BLOCK_N=BLOCK_N,
     #     num_warps=num_warps,
     #     grid=(1,)
@@ -144,10 +141,9 @@ def triton_silumul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         output,
         n_rows,
         n_cols,
-        S,
-        x.stride(0), x.stride(1), x.stride(2),
-        y.stride(0), y.stride(1), y.stride(2),
-        output.stride(0), output.stride(1), output.stride(2),
+        x.stride(0), x.stride(1),
+        y.stride(0), y.stride(1),
+        output.stride(0), output.stride(1),
         BLOCK_N=BLOCK_N,
         num_warps=num_warps,
     )
@@ -169,10 +165,8 @@ def test_silumul(
 ):
     device = torch.cuda.current_device()
 
-    base_x = torch.randn((x_size[1], x_size[0], x_size[2]), dtype=dtype, device=device)
-    base_y = torch.randn((x_size[1], x_size[0], x_size[2]), dtype=dtype, device=device)
-    x = base_x.transpose(0, 1).contiguous()
-    y = base_y.transpose(0, 1).contiguous()
+    x = torch.randn(x_size, dtype=dtype, device=device)
+    y = torch.randn(x_size, dtype=dtype, device=device)
 
     torch_outputs = torch_silumul(x, y)
     triton_outputs = triton_silumul(x, y)
@@ -206,12 +200,8 @@ def benchmark(
 ):
     device = torch.cuda.current_device()
 
-    batch_size = 32
-    assert n_tokens % batch_size == 0, "n_tokens must be a multiple of 32"
-    seq_len = n_tokens // batch_size
-
-    x = torch.randn((batch_size, seq_len, hidden_size), dtype=dtype, device=device)
-    y = torch.randn((batch_size, seq_len, hidden_size), dtype=dtype, device=device)
+    x = torch.randn((n_tokens, hidden_size), dtype=dtype, device=device)
+    y = torch.randn((n_tokens, hidden_size), dtype=dtype, device=device)
 
     if provider == "torch":
         fn = lambda: torch_silumul(x, y)
@@ -232,7 +222,7 @@ def benchmark(
 if __name__ == "__main__":
     import os
 
-    test_silumul((16, 16, 2048))
+    test_silumul((256, 2048))
     os.makedirs("./benchmark_results", exist_ok=True)
     benchmark.run(save_path="./benchmark_results", print_data=False)
 

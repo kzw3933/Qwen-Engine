@@ -11,8 +11,10 @@ from .ops import (
     torch_rotary_embedding,
 )
 from .fused_ops import (
-    triton_spda,
-    torch_spda,
+    triton_prefill_spda,
+    triton_decode_spda,
+    torch_prefill_spda,
+    torch_decode_spda,
     triton_silumul,
     torch_silumul,
 )

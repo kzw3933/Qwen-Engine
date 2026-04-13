@@ -15,20 +15,17 @@ def _triton_embedding_kernel(
     output_ptr,
     n_rows,
     n_cols,
-    seq_len,
-    x_stride_b, x_stride_s,
+    x_stride_t,
     weight_stride_vocab, weight_stride_dim,
-    output_stride_b, output_stride_s, output_stride_d,
+    output_stride_t, output_stride_d,
     BLOCK_N: tl.constexpr,
 ):
     row_start = tl.program_id(axis=0)
     row_step = tl.num_programs(axis=0)
 
     for row_idx in tl.range(row_start, n_rows, row_step):
-        
-        batch_idx = row_idx // seq_len
-        seq_idx = row_idx % seq_len
-        token = tl.load(x_ptr + batch_idx * x_stride_b + seq_idx * x_stride_s)
+        token_idx = row_idx
+        token = tl.load(x_ptr + token_idx * x_stride_t)
         
         for col_start in tl.range(0, n_cols, BLOCK_N):
             col_offsets = col_start + tl.arange(0, BLOCK_N)
@@ -41,7 +38,7 @@ def _triton_embedding_kernel(
             )
 
             tl.store(
-                output_ptr + batch_idx * output_stride_b + seq_idx * output_stride_s + col_offsets * output_stride_d,
+                output_ptr + row_idx * output_stride_t + col_offsets * output_stride_d,
                 embedding,
                 mask=col_mask,
             )
@@ -67,20 +64,20 @@ def get_gpu_props():
     )
 
 
-# x: [B, S]
+# x: [T]
 # weight: [vocab_size, embedding_dim]
-# output: [B, S, embedding_dim]
+# output: [T, D] D = embedding_dim
 def triton_embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    assert x.dim() == 2, "triton_embedding only supports [B, S]"
+    assert x.dim() == 1, "triton_embedding only supports [T]"
     assert weight.dim() == 2, "weight must be [vocab_size, embedding_dim]"
     assert x.is_cuda and weight.is_cuda, "triton_embedding only supports CUDA tensors"
 
-    B, S = x.shape
+    T, = x.shape
     vocab_size, embedding_dim = weight.shape
 
-    n_rows = B * S
+    n_rows = T
     n_cols = embedding_dim
-    y = torch.empty((B, S, embedding_dim), dtype=weight.dtype, device=x.device)
+    y = torch.empty((T, embedding_dim), dtype=weight.dtype, device=x.device)
 
     BLOCK_N = 1024
     num_warps = 8
@@ -93,10 +90,9 @@ def triton_embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     #     y,
     #     n_rows,
     #     n_cols,
-    #     S,
-    #     x.stride(0), x.stride(1),
+    #     x.stride(0),
     #     weight.stride(0), weight.stride(1),
-    #     y.stride(0), y.stride(1), y.stride(2),
+    #     y.stride(0), y.stride(1),
     #     BLOCK_SIZE=BLOCK_SIZE,
     #     num_warps=num_warps,
     #     grid=(1, 1, 1),
@@ -124,10 +120,9 @@ def triton_embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         y,
         n_rows,
         n_cols,
-        S,
-        x.stride(0), x.stride(1),
+        x.stride(0),
         weight.stride(0), weight.stride(1),
-        y.stride(0), y.stride(1), y.stride(2),
+        y.stride(0), y.stride(1),
         BLOCK_N=BLOCK_N,
         num_warps=num_warps,
     )
@@ -135,9 +130,9 @@ def triton_embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return y
 
 
-# x: [B, S]
+# x: [T]
 # weight: [vocab_size, embedding_dim]
-# output: [B, S, embedding_dim]
+# output: [T, D] D = embedding_dim
 def torch_embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return F.embedding(x, weight=weight)
 
@@ -145,8 +140,7 @@ def torch_embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 def test_embedding(x_size: Tuple[int], weight_size: Tuple[int], weight_dtype=torch.bfloat16, atol=1e-3, rtol=1e-3):
     device = torch.cuda.current_device()
 
-    base_x = torch.randint(0, weight_size[0], (x_size[1], x_size[0]), dtype=torch.int32, device=device)
-    x = base_x.transpose(0, 1)
+    x = torch.randint(0, weight_size[0], x_size, dtype=torch.int32, device=device)
     weight = torch.randn(weight_size, dtype=weight_dtype, device=device)
 
     triton_outputs = triton_embedding(x, weight)
@@ -177,9 +171,7 @@ def test_embedding(x_size: Tuple[int], weight_size: Tuple[int], weight_dtype=tor
 def benchmark(n_tokens: int, embedding_dim: int, vocab_size: int, provider: str, weight_dtype=torch.bfloat16):
     device = torch.cuda.current_device()
 
-    batch_size = 32
-    seq_len = n_tokens // batch_size
-    x = torch.randint(0, vocab_size, (batch_size, seq_len), dtype=torch.int32, device=device)
+    x = torch.randint(0, vocab_size, (n_tokens,), dtype=torch.int32, device=device)
     weight = torch.randn((vocab_size, embedding_dim), dtype=weight_dtype, device=device)
 
     if provider == "torch":
@@ -201,6 +193,6 @@ def benchmark(n_tokens: int, embedding_dim: int, vocab_size: int, provider: str,
 if __name__ == "__main__":
     import os
 
-    test_embedding((4, 8), (1024, 2048))
+    test_embedding((32,), (1024, 2048))
     os.makedirs("./benchmark_results", exist_ok=True)
     benchmark.run(save_path="./benchmark_results", print_data=False)

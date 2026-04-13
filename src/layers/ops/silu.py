@@ -15,20 +15,17 @@ def _triton_silu_kernel(
     output_ptr,
     n_rows,
     n_cols,
-    seq_len,
-    x_stride_b, x_stride_s, x_stride_d,
-    output_stride_b, output_stride_s, output_stride_d,
+    x_stride_t, x_stride_d,
+    output_stride_t, output_stride_d,
     BLOCK_N: tl.constexpr,
 ):
     row_start = tl.program_id(axis=0)
     row_step = tl.num_programs(axis=0)
 
     for row_idx in tl.range(row_start, n_rows, row_step):
-        batch_idx = row_idx // seq_len
-        seq_idx = row_idx % seq_len
-
-        row_ptr = x_ptr + batch_idx * x_stride_b + seq_idx * x_stride_s
-        out_ptr = output_ptr + batch_idx * output_stride_b + seq_idx * output_stride_s
+        token_idx = row_idx
+        row_ptr = x_ptr + token_idx * x_stride_t
+        out_ptr = output_ptr + token_idx * output_stride_t
 
         for col_start in tl.range(0, n_cols, BLOCK_N):
             col_offsets = col_start + tl.arange(0, BLOCK_N)
@@ -71,15 +68,15 @@ def get_gpu_props():
     )
 
 
-# x: [B, S, D]
-# output: [B, S, D]
+# x: [T, D]
+# output: [T, D]
 def triton_silu(x: torch.Tensor) -> torch.Tensor:
-    assert x.dim() == 3, "triton_silu only supports [B, S, D]"
+    assert x.dim() == 2, "triton_silu only supports [T, D]"
     assert x.is_cuda, "triton_silu only supports CUDA tensors"
 
-    B, S, hidden_size = x.shape
+    T, hidden_size = x.shape
 
-    n_rows = B * S
+    n_rows = T
     n_cols = hidden_size
     y = torch.empty_strided(x.shape, x.stride(), dtype=x.dtype, device=x.device)
 
@@ -93,9 +90,8 @@ def triton_silu(x: torch.Tensor) -> torch.Tensor:
     #     y,
     #     n_rows,
     #     n_cols,
-    #     S,
-    #     x.stride(0), x.stride(1), x.stride(2), 
-    #     y.stride(0), y.stride(1), y.stride(2),
+    #     x.stride(0), x.stride(1),
+    #     y.stride(0), y.stride(1),
     #     BLOCK_N=BLOCK_N,
     #     num_warps=num_warps,
     #     grid=(1,)
@@ -121,9 +117,8 @@ def triton_silu(x: torch.Tensor) -> torch.Tensor:
         y,
         n_rows,
         n_cols,
-        S,
-        x.stride(0), x.stride(1), x.stride(2),
-        y.stride(0), y.stride(1), y.stride(2),
+        x.stride(0), x.stride(1),
+        y.stride(0), y.stride(1),
         BLOCK_N=BLOCK_N,
         num_warps=num_warps,
     )
@@ -142,8 +137,7 @@ def torch_silu(x: torch.Tensor) -> torch.Tensor:
 
 def test_silu(x_size: Tuple[int], dtype=torch.bfloat16, rtol=1e-3, atol=1e-3):
     device = torch.cuda.current_device()
-    base_x = torch.randn((x_size[1], x_size[0], x_size[2]), dtype=dtype, device=device)
-    x = base_x.transpose(0, 1)
+    x = torch.randn(x_size, dtype=dtype, device=device)
 
     torch_outputs = torch_silu(x)
     triton_outputs = triton_silu(x)
@@ -172,11 +166,7 @@ def test_silu(x_size: Tuple[int], dtype=torch.bfloat16, rtol=1e-3, atol=1e-3):
 def benchmark(n_tokens: int, hidden_size: int, provider: str, dtype=torch.bfloat16):
     device = torch.cuda.current_device()
 
-    batch_size = 32
-    assert n_tokens % batch_size == 0, "n_tokens must be a multiple of 32"
-    seq_len = n_tokens // batch_size
-
-    x = torch.randn((batch_size, seq_len, hidden_size), dtype=dtype, device=device)
+    x = torch.randn((n_tokens, hidden_size), dtype=dtype, device=device)
 
     if provider == 'torch':
         fn = lambda: torch_silu(x)
@@ -195,6 +185,6 @@ def benchmark(n_tokens: int, hidden_size: int, provider: str, dtype=torch.bfloat
 
 if __name__ == '__main__':
     import os
-    test_silu((16, 16, 2048))
+    test_silu((32, 2048))
     os.makedirs('./benchmark_results', exist_ok=True)
     benchmark.run(save_path='./benchmark_results', print_data=False)

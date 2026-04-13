@@ -17,11 +17,10 @@ def _triton_rmsnorm_kernel(
     output_ptr,
     n_rows,
     n_cols,
-    seq_len,
     num_heads,
-    x_stride_b, x_stride_s, x_stride_h, x_stride_d,
+    x_stride_t, x_stride_h, x_stride_d,
     weight_stride,
-    output_stride_b, output_stride_s, output_stride_h, output_stride_d,
+    output_stride_t, output_stride_h, output_stride_d,
     HAS_HEAD_DIM: tl.constexpr,
     eps,
     BLOCK_N: tl.constexpr,
@@ -31,26 +30,20 @@ def _triton_rmsnorm_kernel(
     
     for row_idx in tl.range(row_start, n_rows, row_step):
         if HAS_HEAD_DIM:
-            tokens_per_batch = seq_len * num_heads
-            batch_idx = row_idx // tokens_per_batch
-            rem = row_idx % tokens_per_batch
-            seq_idx = rem // num_heads
-            head_idx = rem % num_heads
+            token_idx = row_idx // num_heads
+            head_idx = row_idx % num_heads
         else:
-            batch_idx = row_idx // seq_len
-            seq_idx = row_idx % seq_len
+            token_idx = row_idx
             head_idx = 0
 
         row_ptr = (
             x_ptr
-            + batch_idx * x_stride_b
-            + seq_idx * x_stride_s
+            + token_idx * x_stride_t
             + head_idx * x_stride_h
         )
         out_ptr = (
             output_ptr
-            + batch_idx * output_stride_b
-            + seq_idx * output_stride_s
+            + token_idx * output_stride_t
             + head_idx * output_stride_h
         )
         
@@ -122,24 +115,22 @@ def get_gpu_props():
     )
 
 
-# x: [B, S, D] or [B, S, H, D]
+# x: [T, D] or [T, H, D]
 # weight: [D]
-# output: [B, S, D] or [B, S, H, D]
+# output: [T, D] or [T, H, D]
 def triton_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    assert x.dim() in (3, 4), "triton_rmsnorm only supports [B, S, D] or [B, S, H, D]"
+    assert x.dim() in (2, 3), "triton_rmsnorm only supports [T, D] or [T, H, D]"
     assert weight.dim() == 1, "weight must be 1D"
     assert x.is_cuda and weight.is_cuda, "triton_rmsnorm only supports CUDA tensors"
     assert weight.shape[0] == x.shape[-1], "weight size must match last dimension of x"
 
-    if x.dim() == 4:
-        B, S, H, D = x.shape
-        n_rows = B * S * H
-        seq_len = S
+    if x.dim() == 3:
+        T, H, D = x.shape
+        n_rows = T * H
         num_heads = H
     else:
-        B, S, D = x.shape
-        n_rows = B * S
-        seq_len = S
+        T, D = x.shape
+        n_rows = T
         num_heads = 1
 
     n_cols = D
@@ -158,12 +149,11 @@ def triton_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.T
     #     y,
     #     n_rows,
     #     n_cols,
-    #     seq_len,
     #     num_heads,
-    #     x.stride(0), x.stride(1), x.stride(2) if x.dim() == 4 else 0, x.stride(-1),
+    #     x.stride(0), x.stride(1) if x.dim() == 3 else 0, x.stride(-1),
     #     weight.stride(0),
-    #     y.stride(0), y.stride(1), y.stride(2) if y.dim() == 4 else 0, y.stride(-1),
-    #     HAS_HEAD_DIM=x.dim() == 4,
+    #     y.stride(0), y.stride(1) if x.dim() == 3 else 0, y.stride(-1),
+    #     HAS_HEAD_DIM=x.dim() == 3,
     #     eps=eps,
     #     BLOCK_N=BLOCK_N,
     #     num_warps=num_warps,
@@ -190,12 +180,11 @@ def triton_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.T
         y,
         n_rows,
         n_cols,
-        seq_len,
         num_heads,
-        x.stride(0), x.stride(1), x.stride(2) if x.dim() == 4 else 0, x.stride(-1),
+        x.stride(0), x.stride(1) if x.dim() == 3 else 0, x.stride(-1),
         weight.stride(0),
-        y.stride(0), y.stride(1), y.stride(2) if y.dim() == 4 else 0, y.stride(-1),
-        HAS_HEAD_DIM=x.dim() == 4,
+        y.stride(0), y.stride(1) if x.dim() == 3 else 0, y.stride(-1),
+        HAS_HEAD_DIM=x.dim() == 3,
         eps=eps,
         BLOCK_N=BLOCK_N,
         num_warps=num_warps,
@@ -203,9 +192,9 @@ def triton_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.T
     
     return y
 
-# x: [B, S, D] or [B, S, H, D]
+# x: [T, D] or [T, H, D]
 # weight: [D]
-# output: [B, S, D] or [B, S, H, D]
+# output: [T, D] or [T, H, D]
 def torch_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
         
     # x_fp32 = x.float()
@@ -227,8 +216,7 @@ def torch_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Te
 def test_rmsnorm(x_size: Tuple[int], eps: float=1e-6, dtype=torch.bfloat16, rtol=1e-3, atol=1e-3):
     
     device = torch.cuda.current_device()
-    base_x = torch.rand((x_size[1], x_size[0], x_size[2]), dtype=dtype, device=device)
-    x = base_x.transpose(0, 1)
+    x = torch.rand(x_size, dtype=dtype, device=device)
     weight = torch.rand(x_size[-1], dtype=dtype, device=device)
     torch_outputs = torch_rmsnorm(x, weight, eps=eps)
     triton_outputs = triton_rmsnorm(x, weight=weight, eps=eps)
@@ -256,12 +244,7 @@ def test_rmsnorm(x_size: Tuple[int], eps: float=1e-6, dtype=torch.bfloat16, rtol
 def benchmark(n_tokens: int, hidden_size: int, provider: str, dtype=torch.bfloat16):
     device = torch.cuda.current_device()
 
-    # 构造输入，保持 [B, S, D]
-    batch_size = 32
-    assert n_tokens % batch_size == 0, "n_tokens must be a multiple of 32"
-    seq_len = n_tokens // batch_size
-
-    x = torch.randn((batch_size, seq_len, hidden_size), dtype=dtype, device=device)
+    x = torch.randn((n_tokens, hidden_size), dtype=dtype, device=device)
     weight = torch.randn((hidden_size,), dtype=dtype, device=device)
     eps = 1e-6
 
@@ -284,6 +267,6 @@ def benchmark(n_tokens: int, hidden_size: int, provider: str, dtype=torch.bfloat
     
 if __name__ == '__main__':
     import os
-    test_rmsnorm((4,8,2048))
+    test_rmsnorm((32,2048))
     os.makedirs('./benchmark_results', exist_ok=True)
     benchmark.run(save_path='./benchmark_results', print_data=False)

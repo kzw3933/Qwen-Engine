@@ -21,13 +21,12 @@ def _triton_rotary_embedding_kernel(
     num_q_heads,
     num_k_heads,
     head_dim,
-    seq_len,
-    pos_stride_b, pos_stride_s,
+    pos_stride_t,
     cache_stride_pos, cache_stride_d,
-    q_stride_b, q_stride_s, q_stride_h, q_stride_d,
-    k_stride_b, k_stride_s, k_stride_h, k_stride_d,
-    q_out_stride_b, q_out_stride_s, q_out_stride_h, q_out_stride_d,
-    k_out_stride_b, k_out_stride_s, k_out_stride_h, k_out_stride_d,
+    q_stride_t, q_stride_h, q_stride_d,
+    k_stride_t, k_stride_h, k_stride_d,
+    q_out_stride_t, q_out_stride_h, q_out_stride_d,
+    k_out_stride_t, k_out_stride_h, k_out_stride_d,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -42,11 +41,9 @@ def _triton_rotary_embedding_kernel(
     k_head_mask = k_head_offsets < num_k_heads
     
     for token_idx in tl.range(token_start, n_tokens, token_step):
-        batch_idx = token_idx // seq_len
-        seq_idx = token_idx % seq_len
 
         position = tl.load(
-            positions_ptr + batch_idx * pos_stride_b + seq_idx * pos_stride_s
+            positions_ptr + token_idx * pos_stride_t
         )
         cache_row_ptr = cos_sin_cache_ptr + position * cache_stride_pos
         
@@ -67,13 +64,11 @@ def _triton_rotary_embedding_kernel(
             
             q_base_ptr = (
                 q_ptr
-                + batch_idx * q_stride_b
-                + seq_idx * q_stride_s
+                + token_idx * q_stride_t
             )
             q_out_base_ptr = (
                 q_out_ptr
-                + batch_idx * q_out_stride_b
-                + seq_idx * q_out_stride_s
+                + token_idx * q_out_stride_t
             )
             q_first_ptr = q_base_ptr + q_head_offsets[:, None] * q_stride_h + dim_offsets[None, :] * q_stride_d
             q_second_ptr = q_first_ptr + rotary_half * q_stride_d
@@ -98,13 +93,11 @@ def _triton_rotary_embedding_kernel(
             
             k_base_ptr = (
                 k_ptr
-                + batch_idx * k_stride_b
-                + seq_idx * k_stride_s
+                + token_idx * k_stride_t
             )
             k_out_base_ptr = (
                 k_out_ptr
-                + batch_idx * k_out_stride_b
-                + seq_idx * k_out_stride_s
+                + token_idx * k_out_stride_t
             )
             k_first_ptr = k_base_ptr + k_head_offsets[:, None] * k_stride_h + dim_offsets[None, :] * k_stride_d
             k_second_ptr = k_first_ptr + rotary_half * k_stride_d
@@ -149,27 +142,24 @@ def get_gpu_props():
     )
 
 # cos_sin_cache: [max_position, rotary_embedding]
-# positions: [B, S]
-# q: [B, S, num_q_heads, head_dim]
-# k: [B, S, num_k_heads, head_dim]  head_dim = rotary_embedding
+# positions: [T]
+# q: [T, num_q_heads, head_dim]
+# k: [T, num_k_heads, head_dim]  head_dim = rotary_embedding
 def triton_rotary_embedding(
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
 ):
-    if positions.dim() == 1:
-        positions = positions.unsqueeze(0)
-
-    B, S = positions.shape
-    n_tokens = B * S
-    num_q_heads = q.shape[2]
-    num_k_heads = k.shape[2]
+    T, = positions.shape
+    n_tokens = T
+    num_q_heads = q.shape[1]
+    num_k_heads = k.shape[1]
     head_dim = q.shape[-1]
 
-    assert q.dim() == 4 and k.dim() == 4, "q and k must be [B, S, num_heads, head_dim]"
-    assert q.shape[:2] == positions.shape, "q must match positions shape on [B, S]"
-    assert k.shape[:2] == positions.shape, "k must match positions shape on [B, S]"
+    assert q.dim() == 3 and k.dim() == 3, "q and k must be [T, num_heads, head_dim]"
+    assert q.shape[:1] == positions.shape, "q must match positions shape on [T]"
+    assert k.shape[:1] == positions.shape, "k must match positions shape on [T]"
     assert q.shape[-1] == k.shape[-1], "q and k must have the same head_dim"
     assert head_dim % 2 == 0, "head_dim must be even for RoPE"
     assert cos_sin_cache.shape[-1] == head_dim, "cos_sin_cache last dim must equal head_dim"
@@ -186,7 +176,7 @@ def triton_rotary_embedding(
     k_head_blocks = triton.cdiv(num_k_heads, BLOCK_H)
     qk_max_head_blocks = max(q_head_blocks, k_head_blocks)
     
-    num_warps = 4
+    num_warps = 8
     
     props = get_gpu_props()
     
@@ -201,13 +191,12 @@ def triton_rotary_embedding(
     #     num_q_heads,
     #     num_k_heads,
     #     head_dim,
-    #     S,
-    #     positions.stride(0), positions.stride(1),
+    #     positions.stride(0),
     #     cos_sin_cache.stride(0), cos_sin_cache.stride(1),
-    #     q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-    #     k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-    #     q_out.stride(0), q_out.stride(1), q_out.stride(2), q_out.stride(3),
-    #     k_out.stride(0), k_out.stride(1), k_out.stride(2), k_out.stride(3),
+    #     q.stride(0), q.stride(1), q.stride(2),
+    #     k.stride(0), k.stride(1), k.stride(2),
+    #     q_out.stride(0), q_out.stride(1), q_out.stride(2),
+    #     k_out.stride(0), k_out.stride(1), k_out.stride(2),
     #     BLOCK_H=BLOCK_H,
     #     BLOCK_D=BLOCK_D,
     #     num_warps=num_warps,
@@ -241,13 +230,12 @@ def triton_rotary_embedding(
         num_q_heads,
         num_k_heads,
         head_dim,
-        S,
-        positions.stride(0), positions.stride(1),
+        positions.stride(0),
         cos_sin_cache.stride(0), cos_sin_cache.stride(1),
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        q_out.stride(0), q_out.stride(1), q_out.stride(2), q_out.stride(3),
-        k_out.stride(0), k_out.stride(1), k_out.stride(2), k_out.stride(3),
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        q_out.stride(0), q_out.stride(1), q_out.stride(2),
+        k_out.stride(0), k_out.stride(1), k_out.stride(2),
         BLOCK_H=BLOCK_H,
         BLOCK_D=BLOCK_D,
         num_warps=num_warps,
@@ -257,8 +245,8 @@ def triton_rotary_embedding(
 
 
 # cos_sin_cache: [max_position, rotary_embedding]
-# positions: [B, S]
-# q, k: [B, S, num_heads, head_dim] head_dim = rotary_embedding
+# positions: [T]
+# q, k: [T, num_heads, head_dim] head_dim = rotary_embedding
 def torch_rotary_embedding(
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
@@ -266,8 +254,8 @@ def torch_rotary_embedding(
     k: torch.Tensor,
 ):
     cos, sin = cos_sin_cache[positions].chunk(2, dim=-1)
-    cos = cos.unsqueeze(2)
-    sin = sin.unsqueeze(2)
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
 
     q_fp32 = q.float()
     q1, q2 = q_fp32.chunk(2, dim=-1)
@@ -298,13 +286,10 @@ def test_rotary_embedding(
 
     device = torch.cuda.current_device()
 
-    base_positions = torch.randint(0, max_position, (positions_size[1], positions_size[0]), dtype=torch.int32, device=device)
-    positions = base_positions.transpose(0, 1)
+    positions = torch.randint(0, max_position, positions_size, dtype=torch.int32, device=device)
     cos_sin_cache = torch.randn((max_position, rotary_embedding), dtype=torch.float32, device=device)
-    base_q = torch.randn((q_size[1], q_size[0], q_size[2], q_size[3]), dtype=dtype, device=device)
-    base_k = torch.randn((k_size[1], k_size[0], k_size[2], k_size[3]), dtype=dtype, device=device)
-    q = base_q.transpose(0, 1)
-    k = base_k.transpose(0, 1)
+    q = torch.randn(q_size, dtype=dtype, device=device)
+    k = torch.randn(k_size, dtype=dtype, device=device)
 
     torch_q, torch_k = torch_rotary_embedding(cos_sin_cache, positions, q, k)
     triton_q, triton_k = triton_rotary_embedding(cos_sin_cache, positions, q, k)
@@ -345,14 +330,10 @@ def benchmark(
 ):
     device = torch.cuda.current_device()
 
-    batch_size = 32
-    assert n_tokens % batch_size == 0, "n_tokens must be a multiple of 32"
-    seq_len = n_tokens // batch_size
-
-    positions = torch.randint(0, max_position, (batch_size, seq_len), dtype=torch.int32, device=device)
+    positions = torch.randint(0, max_position, (n_tokens,), dtype=torch.int32, device=device)
     cos_sin_cache = torch.randn((max_position, head_dim), dtype=torch.float32, device=device)
-    q = torch.randn((batch_size, seq_len, num_q_heads, head_dim), dtype=dtype, device=device)
-    k = torch.randn((batch_size, seq_len, num_k_heads, head_dim), dtype=dtype, device=device)
+    q = torch.randn((n_tokens, num_q_heads, head_dim), dtype=dtype, device=device)
+    k = torch.randn((n_tokens, num_k_heads, head_dim), dtype=dtype, device=device)
 
     if provider == 'torch':
         fn = lambda: torch_rotary_embedding(cos_sin_cache, positions, q, k)
@@ -376,9 +357,9 @@ def benchmark(
 if __name__ == '__main__':
     import os
     test_rotary_embedding(
-        positions_size=(4, 8),
-        q_size=(4, 8, 32, 128),
-        k_size=(4, 8, 16, 128),
+        positions_size=(32,),
+        q_size=(32, 32, 128),
+        k_size=(32, 16, 128),
         rotary_embedding=128,
     )
     os.makedirs('./benchmark_results', exist_ok=True)

@@ -42,7 +42,7 @@ def _print_load_report(loaded_params: set[str], skipped_params: list[tuple[str, 
     print(line)
 
 
-def load_weights_from_checkpoint(model: nn.Module, model_name_or_path: str):
+def load_weights_from_checkpoint(model: nn.Module, model_name_or_path: str, silent: bool = False):
     checkpoint_path = None
 
     if model_name_or_path.startswith("~"):
@@ -94,7 +94,8 @@ def load_weights_from_checkpoint(model: nn.Module, model_name_or_path: str):
         except RuntimeError as e:
             skipped_params.append((hf_name, f"Copy failed: {e}"))
 
-    _print_load_report(loaded_params, skipped_params)
+    if not silent:
+        _print_load_report(loaded_params, skipped_params)
 
     return {
         "loaded_params": sorted(loaded_params),

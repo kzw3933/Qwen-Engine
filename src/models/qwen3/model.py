@@ -11,6 +11,8 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from layers import *
+from engine.context import Context
+from engine.kvcache import KVCachePool
 
 
 class Qwen3Embedding(nn.Module):
@@ -87,10 +89,7 @@ class Qwen3RotaryEmbedding(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         mode: str = "triton",
-    ) -> torch.Tensor:
-        if positions.dim() == 1:
-            positions = positions.unsqueeze(0)
-            
+    ) -> torch.Tensor:            
         if mode == "triton":
             q_out, k_out = triton_rotary_embedding(self.cos_sin_cache, positions, q, k)
         else:
@@ -125,11 +124,29 @@ class Qwen3SDPA(nn.Module):
     def __init__(self):
         super().__init__()
         
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float, mode: str = "triton") -> torch.Tensor:
-        if mode == "triton":
-            return triton_spda(q, k, v, scale=scale)
+    def forward(
+        self, 
+        q: torch.Tensor, 
+        k: torch.Tensor, 
+        v: torch.Tensor, 
+        context: Context,
+        kv_cache_pool: KVCachePool,
+        layer_idx: int,
+        scale: float, 
+        mode: str = "triton"
+    ) -> torch.Tensor:
+        if context.is_decode:
+            if mode == "triton":
+                output = triton_decode_spda(q, k, v, context, kv_cache_pool, layer_idx, scale)
+            else:
+                output = torch_decode_spda(q, k, v, context, kv_cache_pool, layer_idx, scale)
         else:
-            return torch_spda(q, k, v, scale=scale)
+            if mode == "triton":
+                output = triton_prefill_spda(q, k, v, context, kv_cache_pool, layer_idx, scale)
+            else:
+                output = torch_prefill_spda(q, k, v, context, kv_cache_pool, layer_idx, scale)
+        
+        return output 
 
 
 class Qwen3Attention(nn.Module):
@@ -170,21 +187,29 @@ class Qwen3Attention(nn.Module):
 
         self.o_proj = Qwen3Linear(num_heads * head_dim, hidden_size, bias=False, dtype=dtype)
 
-    def forward(self, x: torch.Tensor, positions: torch.Tensor, mode: str = "triton") -> torch.Tensor:
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        positions: torch.Tensor, 
+        context: Context, 
+        kv_cache_pool: KVCachePool,
+        layer_idx: int,
+        mode: str = "triton"
+    ) -> torch.Tensor:
 
-        q = self.q_proj(x, mode=mode).view(x.size(0), x.size(1), self.num_heads, self.head_dim)
-        k = self.k_proj(x, mode=mode).view(x.size(0), x.size(1), self.num_kv_heads, self.head_dim)
-        v = self.v_proj(x, mode=mode).view(x.size(0), x.size(1), self.num_kv_heads, self.head_dim)
+        q = self.q_proj(x, mode=mode).view(x.size(0), self.num_heads, self.head_dim)
+        k = self.k_proj(x, mode=mode).view(x.size(0), self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x, mode=mode).view(x.size(0), self.num_kv_heads, self.head_dim)
 
         if not self.qkv_bias:
             q = self.q_norm(q, mode=mode)
             k = self.k_norm(k, mode=mode)
 
         q, k = self.rotary_embed(positions, q, k, mode=mode)
-
-        attn_out = self.spda(q, k, v, scale=self.scale)
         
-        attn_out = attn_out.reshape(x.size(0), x.size(1), self.num_heads * self.head_dim)
+        attn_out = self.spda(q, k, v, context, kv_cache_pool, layer_idx, self.scale, mode)
+        
+        attn_out = attn_out.reshape(x.size(0), self.num_heads * self.head_dim)
         out = self.o_proj(attn_out, mode=mode)
 
         return out
@@ -250,12 +275,18 @@ class Qwen3DecoderLayer(nn.Module):
             dtype=dtype,
         )
 
-    def forward(self, x: torch.Tensor, mode: str = "triton") -> torch.Tensor:
-        positions = torch.arange(x.size(1), device=x.device)
-
+    def forward(self, x: torch.Tensor, positions: torch.Tensor, context: Context, kv_cache_pool: KVCachePool, layer_idx: int, mode: str = "triton") -> torch.Tensor:
+        
         residual = x
         x = self.input_layernorm(x, mode=mode)
-        x = self.self_attn(x, positions=positions, mode=mode)
+        x = self.self_attn(
+            x, 
+            positions=positions, 
+            context=context, 
+            kv_cache_pool=kv_cache_pool, 
+            layer_idx=layer_idx,
+            mode=mode
+        )
         
         x = residual + x
 
@@ -313,11 +344,18 @@ class Qwen3Model(nn.Module):
         )
         self.norm = Qwen3RMSNorm(hidden_size, eps=rms_norm_epsilon, dtype=dtype)
 
-    def forward(self, input_ids: torch.Tensor, mode: str = "triton") -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, context: Context, kv_cache_pool: KVCachePool, mode: str = "triton") -> torch.Tensor:
 
         x = self.embed_tokens(input_ids, mode=mode)
-        for layer in self.layers:
-            x = layer(x, mode=mode)
+        for layer_idx, layer in enumerate(self.layers):
+            x = layer(
+                x, 
+                positions, 
+                context, 
+                kv_cache_pool,
+                layer_idx=layer_idx, 
+                mode=mode
+            )
         x = self.norm(x, mode=mode)
         return x
 
@@ -379,8 +417,8 @@ class Qwen3ForCausalLM(nn.Module):
         if tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
-    def forward(self, input_ids: torch.Tensor, mode: str = "triton") -> torch.Tensor:
-        hidden_states = self.model(input_ids, mode=mode)
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, context: Context, kv_cache_pool: KVCachePool, mode: str = "triton") -> torch.Tensor:
+        hidden_states = self.model(input_ids, positions, context, kv_cache_pool, mode=mode)
         return self.lm_head(hidden_states, mode=mode)
 
 

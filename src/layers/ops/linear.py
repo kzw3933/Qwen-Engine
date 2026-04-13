@@ -60,10 +60,9 @@ def _triton_linear_kernel(
     n_rows,
     n_cols,
     hidden_size,
-    seq_len,
-    x_stride_b, x_stride_s, x_stride_d,
+    x_stride_t, x_stride_d,
     weight_stride_o, weight_stride_i,
-    output_stride_b, output_stride_s, output_stride_o,
+    output_stride_t, output_stride_o,
     bias_stride,
     use_bias: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -87,23 +86,21 @@ def _triton_linear_kernel(
     
     row_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     row_mask = row_offsets < n_rows
-    batch_offsets = row_offsets // seq_len
-    seq_offsets = row_offsets % seq_len
+    
+    token_offsets = row_offsets
             
     col_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     col_mask = col_offsets < n_cols
 
     output_offsets = (
-        batch_offsets[:, None] * output_stride_b
-        + seq_offsets[:, None] * output_stride_s
+        token_offsets[:, None] * output_stride_t
         + col_offsets[None, :] * output_stride_o
     )
     output_mask = row_mask[:, None] & col_mask[None, :]
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     x_base_offsets = (
-        batch_offsets[:, None] * x_stride_b
-        + seq_offsets[:, None] * x_stride_s
+        token_offsets[:, None] * x_stride_t
     )
 
     for k_start in range(0, hidden_size, STEP_K):
@@ -134,22 +131,22 @@ def _triton_linear_kernel(
         mask=output_mask,
     )
 
-# x: [B, S, D]
+# x: [T, D]
 # weight: [output_size, input_size] input_size = D
 # bias: [output_size]
 def triton_linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None):
-    B, S, hidden_size = x.shape
+    T, hidden_size = x.shape
     output_size = weight.shape[0]
     
-    assert x.dim() == 3, "triton_linear only supports [B, S, hidden_size]"
+    assert x.dim() == 2, "triton_linear only supports [T, hidden_size]"
     assert weight.dim() == 2, "weight must be [output_size, hidden_size]"
     assert x.is_cuda and weight.is_cuda, "triton_linear only supports CUDA tensors"
     assert weight.shape[1] == hidden_size, "weight input size must match x hidden size"
 
-    n_rows = B * S
+    n_rows = T
     n_cols = output_size
     
-    output = torch.empty((B, S, n_cols), dtype=x.dtype, device=x.device)
+    output = torch.empty((T, n_cols), dtype=x.dtype, device=x.device)
     
     grid = lambda meta: (triton.cdiv(n_rows, meta["BLOCK_M"]) * triton.cdiv(n_cols, meta["BLOCK_N"]), )
         
@@ -161,10 +158,9 @@ def triton_linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Te
         n_rows,
         n_cols,
         hidden_size,
-        S,
-        x.stride(0), x.stride(1), x.stride(2),
+        x.stride(0), x.stride(1),
         weight.stride(0), weight.stride(1),
-        output.stride(0), output.stride(1), output.stride(2),
+        output.stride(0), output.stride(1),
         bias.stride(0) if bias is not None else 0,
         use_bias=bias is not None,
     )
@@ -193,10 +189,8 @@ def test_linear(x_size: Tuple[int], weight_size: Tuple[int], use_bias: bool=True
 
     device = torch.cuda.current_device()
 
-    base_x = torch.randn((x_size[1], x_size[0], x_size[2]), dtype=dtype, device=device)
-    x = base_x.transpose(0, 1)
-    base_weight = torch.randn((weight_size[1], weight_size[0]), dtype=dtype, device=device)
-    weight = base_weight.transpose(0, 1)
+    x = torch.randn(x_size, dtype=dtype, device=device)
+    weight = torch.randn(weight_size, dtype=dtype, device=device)
     bias = torch.randn((weight_size[0],), dtype=dtype, device=device) if use_bias else None
 
     torch_outputs = torch_linear(x, weight, bias)
@@ -235,11 +229,7 @@ def benchmark(
 ):
     device = torch.cuda.current_device()
 
-    batch_size = 32
-    assert n_tokens % batch_size == 0, "n_tokens must be a multiple of 32"
-    seq_len = n_tokens // batch_size
-
-    x = torch.randn((batch_size, seq_len, hidden_size), dtype=dtype, device=device)
+    x = torch.randn((n_tokens, hidden_size), dtype=dtype, device=device)
     weight = torch.randn((output_size, hidden_size), dtype=dtype, device=device)
     bias = torch.randn((output_size,), dtype=dtype, device=device) if use_bias else None
 
@@ -262,6 +252,6 @@ def benchmark(
     
 if __name__ == '__main__':
     import os
-    test_linear((16,16,512), (1024, 512), False)
+    test_linear((256, 512), (1024, 512), False)
     os.makedirs('./benchmark_results', exist_ok=True)
     benchmark.run(save_path='./benchmark_results', print_data=False)
