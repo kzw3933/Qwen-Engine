@@ -18,16 +18,19 @@ def main():
     prompt_texts = [
         "介绍一下Qwen模型",
         "什么是KV Cache?",
+        "介绍一下快速排序算法"
     ]
     
     max_new_tokens = 64
-    
     max_num_seqs = 4
     max_model_len = 256
-    runtime_mode = "triton"
+    block_size = 16
+    num_blocks = max_num_seqs * ((max_model_len + block_size - 1) // block_size)
+    
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    runtime_mode = "triton"
 
     hf_config = AutoConfig.from_pretrained(
         model_name_or_path,
@@ -47,8 +50,8 @@ def main():
     
     kv_cache_pool = KVCachePool(
         num_layers=config.num_hidden_layers,
-        max_num_seqs=max_num_seqs,
-        max_model_len=max_model_len,
+        num_blocks=num_blocks,
+        block_size=block_size,
         num_kv_heads=config.num_key_value_heads,
         head_dim=config.head_dim,
         dtype=model_dtype,

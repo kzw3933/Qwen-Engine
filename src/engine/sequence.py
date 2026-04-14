@@ -14,8 +14,14 @@ class Sequence:
     seq_id: int
     prompt_token_ids: List[int]
     output_token_ids: List[int] = field(default_factory=list)
-    cache_slot: int | None = None
+    
+    # paged kv cache
+    block_ids: List[int] = field(default_factory=list)
+    
+    # runtime states
     num_computed_tokens: int = 0
+    num_kv_tokens: int = 0
+    
     max_new_tokens: int = 128
     status: SequenceStatus = SequenceStatus.WAITING
     finish_reason: str | None = None

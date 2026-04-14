@@ -14,8 +14,14 @@ class Context:
     # decode
     cache_lens: torch.Tensor | None = None
     
-    # both
-    cache_slots: torch.Tensor | None = None
+    # sequence
+    seq_lens: torch.Tensor | None = None
+    
+    # paged cache
+    block_tables: torch.Tensor | None = None
+    block_size: int | None = None
+    slot_mapping: torch.Tensor | None = None
+    block_offsets: torch.Tensor | None = None
     
     
     

@@ -28,9 +28,7 @@ class LLMEngine:
             max_new_tokens=max_new_tokens
         )
         self._next_seq_id += 1
-        sequence.cache_slot = self.kv_cache_pool.allocate_slot()
         return sequence
-    
     
     def should_stop(self, sequence: Sequence):
         if sequence.output_len >= sequence.max_new_tokens:
@@ -103,6 +101,7 @@ class LLMEngine:
             return self.decode_sequences(sequences)
         finally:
             for seq in sequences:
-                if seq.cache_slot is not None:
-                    self.kv_cache_pool.free_slot(seq.cache_slot)
-                    seq.cache_slot = None
+                if seq.block_ids:
+                    self.kv_cache_pool.free_blocks_by_ids(seq.block_ids)
+                    seq.block_ids.clear()
+                
