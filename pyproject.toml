@@ -12,6 +12,7 @@ dependencies = [
     "safetensors>=0.7.0",
     "torch>=2.11.0",
     "transformers>=5.5.0",
+    "triton>=3.6.0",
 ]
 
 [[tool.uv.index]]

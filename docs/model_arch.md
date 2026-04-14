@@ -12,7 +12,7 @@
 - Head Dim：128
 - MLP 中间维度：3072
 - 词表大小：151936
-- 最大位置（RoPE）：32768
+- 最大位置（RoPE）：40960
 - RoPE Theta（base）：1000000
 - RMSNorm Epsilon：1e-6
 - 激活：SwiGLU

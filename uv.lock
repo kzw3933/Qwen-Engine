@@ -1052,6 +1052,7 @@ dependencies = [
     { name = "safetensors" },
     { name = "torch" },
     { name = "transformers" },
+    { name = "triton" },
 ]
 
 [package.metadata]
@@ -1063,6 +1064,7 @@ requires-dist = [
     { name = "safetensors", specifier = ">=0.7.0" },
     { name = "torch", specifier = ">=2.11.0" },
     { name = "transformers", specifier = ">=5.5.0" },
+    { name = "triton", specifier = ">=3.6.0" },
 ]
 
 [[package]]
