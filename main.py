@@ -15,18 +15,12 @@ from engine import KVCachePool, LLMEngine
 
 def main():
     model_name_or_path = "Qwen/Qwen3-0.6B"
-    prompt_texts = [
-        "介绍一下Qwen模型",
-        "什么是KV Cache?",
-        "介绍一下快速排序算法"
-    ]
     
     max_new_tokens = 64
     max_num_seqs = 4
     max_model_len = 256
     block_size = 16
     num_blocks = max_num_seqs * ((max_model_len + block_size - 1) // block_size)
-    
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model_dtype = torch.bfloat16 if device == "cuda" else torch.float32
@@ -62,21 +56,31 @@ def main():
         model=model,
         tokenizer=tokenizer,
         kv_cache_pool=kv_cache_pool,
+        max_num_seqs=max_num_seqs,
         device=torch.device(device),
         mode=runtime_mode,
     )
     
-    output_texts = engine.generate(
-        prompt_texts=prompt_texts,
-        max_new_tokens=max_new_tokens,
+    prompt_texts = [
+        "介绍一下Qwen模型",
+        "How can remote teams improve trust, focus, communication, and delivery speed without adding more meetings? Please include practical examples that small teams can apply immediately.",
+        "How can remote teams improve trust, focus, communication, and delivery speed without adding",
+    ]
+    
+    engine.submit(
+        prompt_texts=prompt_texts, max_new_tokens=max_new_tokens
     )
     
-    for prompt_text, output_text in zip(prompt_texts, output_texts):
+    def print_info(prompt_text, output_text):
         print("=" * 88)
         print(f"Prompt: {prompt_text}")
         print("=" * 88)
         print(output_text)
         print("=" * 88)
+    
+    
+    engine.serving(print_func=print_info)
+    
 
 if __name__ == "__main__":
     main()

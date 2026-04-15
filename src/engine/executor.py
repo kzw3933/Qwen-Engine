@@ -14,7 +14,7 @@ class ModelExecutor:
         self.device = device
         self.mode = mode
     
-    def forward(self, input_ids, positions, context):
+    def execute(self, input_ids, positions, context):
         return self.model(
             input_ids=input_ids,
             positions=positions,
@@ -22,15 +22,7 @@ class ModelExecutor:
             kv_cache_pool=self.kv_cache_pool,
             mode=self.mode
         )
-        
-    def ensure_sequence_capacity(self, sequence: Sequence, target_len: int) -> None:
-        required_blocks = self.kv_cache_pool.get_num_required_blocks(target_len)
-        missing_blocks = required_blocks - len(sequence.block_ids)
-        
-        if missing_blocks > 0:
-            new_block_ids = self.kv_cache_pool.allocate_blocks(missing_blocks)
-            sequence.block_ids.extend(new_block_ids)
-            
+
             
     def build_block_tables(self, sequences: List[Sequence]) -> torch.Tensor:
         max_num_blocks = max(len(seq.block_ids) for seq in sequences)
@@ -51,10 +43,21 @@ class ModelExecutor:
                 
         return block_tables
     
+    def gather_prefill_last_logits(self, logits: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+        last_indices = cu_seqlens[1:] - 1
+        return logits[last_indices]
+    
+    
+    def sample_next_tokens(self, logits):
+        if logits.dim() != 2:
+            raise ValueError(f"Expected logits shape [B, V], got {tuple(logits.shape)}")
+        return torch.argmax(logits, dim=-1).tolist()
+    
     def build_prefill_store_mapping(
         self,
         sequences: List[Sequence],
-        cu_seqlens: torch.Tensor
+        cu_seqlens: torch.Tensor,
+        prefix_lens: List[int],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         total_tokens = int(cu_seqlens[-1].item())
         slot_mapping = torch.empty((total_tokens, ), dtype=torch.long, device=self.device)
@@ -63,14 +66,16 @@ class ModelExecutor:
         for seq_idx, seq in enumerate(sequences):
             start = int(cu_seqlens[seq_idx].item())
             end = int(cu_seqlens[seq_idx+1].item())
+            prefill_start = prefix_lens[seq_idx]
             
-            for token_idx_in_seq in range(end - start):
-                logical_block_idx = token_idx_in_seq // self.kv_cache_pool.block_size
-                block_offset = token_idx_in_seq % self.kv_cache_pool.block_size
+            for token_idx_in_chunk in range(end - start):
+                token_pos = prefill_start + token_idx_in_chunk
+                logical_block_idx = token_pos // self.kv_cache_pool.block_size
+                block_offset = token_pos % self.kv_cache_pool.block_size
                 physical_block_id = seq.block_ids[logical_block_idx]
                 
-                slot_mapping[start+token_idx_in_seq] = physical_block_id
-                block_offsets[start+token_idx_in_seq] = block_offset
+                slot_mapping[start+token_idx_in_chunk] = physical_block_id
+                block_offsets[start+token_idx_in_chunk] = block_offset
                 
         return slot_mapping, block_offsets
     
@@ -97,17 +102,27 @@ class ModelExecutor:
                 
         return cache_lens, slot_mapping, block_offsets
     
-    
-    def run_prefill(self, sequences: List[Sequence]):
+    def run_prefill(self, sequences: List[Sequence]) -> Tuple[torch.Tensor, Context]:
+        for seq in sequences:
+            self.kv_cache_pool.allocate_prefill_sequence(seq)
+        
         input_ids = []
         positions = []
         cu_seqlens = [0]
         
         for seq in sequences:
-            self.ensure_sequence_capacity(seq, seq.prompt_len)
-            input_ids.extend(seq.prompt_token_ids)
-            positions.extend(range(seq.prompt_len))
-            cu_seqlens.append(cu_seqlens[-1] + seq.prompt_len)
+            if seq.prompt_suffix_len == 0:
+                suffix_start = seq.prompt_len - 1
+                suffix_token = seq.prompt_token_ids[-1]
+                input_ids.append(suffix_token)
+                positions.append(suffix_start)
+                cu_seqlens.append(cu_seqlens[-1] + 1)
+            else:
+                suffix_start = seq.shared_prefix_len
+                suffix_tokens = seq.prompt_token_ids[suffix_start:]
+                input_ids.extend(suffix_tokens)
+                positions.extend(range(suffix_start, seq.prompt_len))
+                cu_seqlens.append(cu_seqlens[-1] + len(suffix_tokens))
             
         input_ids = torch.tensor(input_ids, dtype=torch.long, device=self.device)
         positions = torch.tensor(positions, dtype=torch.long, device=self.device)
@@ -119,36 +134,44 @@ class ModelExecutor:
             device=self.device
         )
         
+        prefix_lens = torch.tensor(
+            [
+                seq.shared_prefix_len if seq.prompt_suffix_len != 0
+                else seq.shared_prefix_len - 1
+                for seq in sequences
+            ],
+            dtype=torch.long,
+            device=self.device
+        )
+        
         block_tables = self.build_block_tables(sequences)
-        slot_mapping, block_offsets = self.build_prefill_store_mapping(sequences, cu_seqlens)
+        slot_mapping, block_offsets = self.build_prefill_store_mapping(sequences, cu_seqlens, prefix_lens)
         
         context = Context(
             is_decode=False,
             cu_seqlens=cu_seqlens,
-            max_seqlen=max(seq.prompt_len for seq in sequences),
+            max_seqlen=max(seq.prompt_suffix_len for seq in sequences),
+            prefix_lens=prefix_lens,
             seq_lens=seq_lens,
             block_tables=block_tables,
             block_size=self.kv_cache_pool.block_size,
             slot_mapping=slot_mapping,
             block_offsets=block_offsets
         )
-        
-        logits = self.forward(
+            
+        logits = self.execute(
             input_ids=input_ids,
             positions=positions,
-            context=context,
+            context=context
         )
         
-        for seq in sequences:
-            seq.num_computed_tokens = seq.prompt_len
-            seq.num_kv_tokens = seq.prompt_len
-            seq.status = SequenceStatus.PREFILLED
-                
         return logits, context
     
-    def gather_prefill_last_logits(self, logits: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
-        last_indices = cu_seqlens[1:] - 1
-        return logits[last_indices]
+    def release_sequence(self, seq: Sequence):
+        self.kv_cache_pool.release_sequence(seq)
+        
+    def register_shared_blocks(self, sequences: List[Sequence]) -> None:
+        self.kv_cache_pool.register_shared_blocks(sequences)
     
     
     def run_decode_step(self, sequences: List[Sequence]):
@@ -156,7 +179,7 @@ class ModelExecutor:
         positions = [seq.num_computed_tokens for seq in sequences]
         
         for seq in sequences:
-            self.ensure_sequence_capacity(seq, seq.num_kv_tokens+1)
+            self.kv_cache_pool.allocate_decode_sequence(seq)
             
         input_ids = torch.tensor(input_ids, dtype=torch.long, device=self.device)
         positions = torch.tensor(positions, dtype=torch.long, device=self.device)
@@ -176,24 +199,13 @@ class ModelExecutor:
             block_offsets=block_offsets
         )
                     
-        logits = self.forward(
+        logits = self.execute(
             input_ids=input_ids,
             positions=positions,
             context=context,
         )
-        
-        for seq in sequences:
-            seq.num_computed_tokens += 1
-            seq.num_kv_tokens += 1
-            seq.status = SequenceStatus.DECODING
-        
-        return logits, context
-    
-    
-    def sample_next_tokens(self, logits):
-        if logits.dim() != 2:
-            raise ValueError(f"Expected logits shape [B, V], got {tuple(logits.shape)}")
-        return torch.argmax(logits, dim=-1).tolist()
+                
+        return logits
     
     
     

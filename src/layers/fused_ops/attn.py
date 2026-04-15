@@ -53,14 +53,18 @@ def _triton_store_kv_cache_kernel(
         src_k_ptr
         + token_idx * src_stride_t
         + kv_head_idx * src_stride_h
-        + d_offsets * src_stride_d
+        + d_offsets * src_stride_d,
+        mask=d_mask,
+        other=0.0
     )
     
     v_vec = tl.load(
         src_v_ptr
         + token_idx * src_stride_t
         + kv_head_idx * src_stride_h
-        + d_offsets * src_stride_d
+        + d_offsets * src_stride_d,
+        mask=d_mask,
+        other=0.0
     )
     
     tl.store(
@@ -150,17 +154,22 @@ def triton_store_kv_cache(
     
 @triton.jit
 def _triton_prefill_flash_attention_kernel(
-    q_ptr, k_ptr, v_ptr, o_ptr,
+    q_ptr, o_ptr,
+    k_cache_ptr, v_cache_ptr,
     cu_seqlens_ptr, 
+    seq_lens_ptr,
+    prefix_lens_ptr,
+    block_tables_ptr,
     q_stride_t, q_stride_h, q_stride_d,
-    k_stride_t, k_stride_h, k_stride_d,
-    v_stride_t, v_stride_h, v_stride_d,
     o_stride_t, o_stride_h, o_stride_d,
+    cache_stride_layer, cache_stride_block, cache_stride_pos, cache_stride_h, cache_stride_d,
+    block_table_stride_b, block_table_stride_blk,
+    layer_idx,
     scale,
+    block_size,
     num_q_heads,
     num_kv_heads,
     head_dim,
-    max_seqlen,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -174,12 +183,16 @@ def _triton_prefill_flash_attention_kernel(
     
     seq_start = tl.load(cu_seqlens_ptr + seq_idx)
     seq_end = tl.load(cu_seqlens_ptr + seq_idx + 1)
-    seq_len = seq_end - seq_start
+    suffix_len = seq_end - seq_start
+    full_len = tl.load(seq_lens_ptr + seq_idx)
+    prefix_len = tl.load(prefix_lens_ptr + seq_idx)
     
     m_offsets = seq_block_idx * BLOCK_M + tl.arange(0, BLOCK_M)
-    m_mask = m_offsets < seq_len
+    m_mask = m_offsets < suffix_len
     d_offsets = tl.arange(0, BLOCK_D)
     d_mask = d_offsets < head_dim
+    
+    q_abs_pos = prefix_len + m_offsets
     
     q = tl.load(
         q_ptr
@@ -194,15 +207,28 @@ def _triton_prefill_flash_attention_kernel(
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
     
-    for n_start in tl.range(0, max_seqlen, BLOCK_N):
+    for n_start in tl.range(0, full_len, BLOCK_N):
         n_offsets = n_start + tl.arange(0, BLOCK_N)
-        n_mask = n_offsets < seq_len
+        n_mask = n_offsets < full_len
+        
+        logical_block_idx = n_offsets // block_size
+        block_offsets = n_offsets % block_size
+        
+        physical_block_idx = tl.load(
+            block_tables_ptr
+            +seq_idx * block_table_stride_b
+            +logical_block_idx*block_table_stride_blk,
+            mask=n_mask,
+            other=0,
+        )
         
         k = tl.load(
-            k_ptr
-            + (seq_start + n_offsets[None, :]) * k_stride_t
-            + kv_head_idx * k_stride_h
-            + d_offsets[:, None] * k_stride_d,
+            k_cache_ptr
+            + layer_idx * cache_stride_layer
+            + physical_block_idx[None, :] * cache_stride_block
+            + block_offsets[None, :] * cache_stride_pos
+            + kv_head_idx * cache_stride_h
+            + d_offsets[:, None] * cache_stride_d,
             mask=d_mask[:, None] & n_mask[None, :],
             other=0.0
         )
@@ -210,7 +236,7 @@ def _triton_prefill_flash_attention_kernel(
         qk = tl.dot(q, k)
         qk = qk * scale
         
-        casual_mask = m_offsets[:, None] >= n_offsets[None, :]
+        casual_mask = q_abs_pos[:, None] >= n_offsets[None, :]
         qk = tl.where(
             m_mask[:, None] & n_mask[None, :] & casual_mask,
             qk,
@@ -224,10 +250,12 @@ def _triton_prefill_flash_attention_kernel(
         p = tl.exp(qk - m_i_new[:, None])
         
         v = tl.load(
-            v_ptr
-            + (seq_start + n_offsets[:, None]) * v_stride_t
-            + kv_head_idx * v_stride_h
-            + d_offsets[None, :] * v_stride_d,
+            v_cache_ptr
+            + layer_idx * cache_stride_layer
+            + physical_block_idx[:, None] * cache_stride_block
+            + block_offsets[:, None] * cache_stride_pos
+            + kv_head_idx * cache_stride_h
+            + d_offsets[None, :] * cache_stride_d,
             mask=n_mask[:, None] & d_mask[None, :],
             other=0.0
         )
@@ -270,6 +298,11 @@ def triton_prefill_spda(
     assert context.slot_mapping is not None, "prefill requires context.slot_mapping"
     assert context.block_offsets is not None, "prefill requires context.block_offsets"
     assert context.max_seqlen is not None, "prefill requires context.max_seqlen"
+    assert context.seq_lens is not None, "prefill requires context.seq_lens"
+    assert context.prefix_lens is not None, "prefill requires context.prefix_lens"
+    assert context.block_tables is not None, "prefill requires context.block_tables"
+    assert context.block_size is not None, "prefill requires context.block_size"
+
 
     _n_tokens, num_q_heads, head_dim = q.shape
     _, num_kv_heads, _ = k.shape
@@ -313,17 +346,23 @@ def triton_prefill_spda(
     )
     
     _triton_prefill_flash_attention_kernel[grid](
-        q, k, v, output,
+        q, output,
+        kv_cache_pool.k_caches,
+        kv_cache_pool.v_caches,
         cu_seqlens,
+        context.seq_lens,
+        context.prefix_lens,
+        context.block_tables,
         q.stride(0), q.stride(1), q.stride(2),
-        k.stride(0), k.stride(1), k.stride(2),
-        v.stride(0), v.stride(1), v.stride(2),
         output.stride(0), output.stride(1), output.stride(2),
+        kv_cache_pool.k_caches.stride(0), kv_cache_pool.k_caches.stride(1), kv_cache_pool.k_caches.stride(2), kv_cache_pool.k_caches.stride(3), kv_cache_pool.k_caches.stride(4), 
+        context.block_tables.stride(0), context.block_tables.stride(1),
+        layer_idx, 
         scale,
+        context.block_size,
         num_q_heads,
         num_kv_heads,
         head_dim,
-        max_seqlen,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_D=BLOCK_D
@@ -683,77 +722,68 @@ def torch_prefill_spda(
     scale: float,
 ) -> torch.Tensor:
     batch_size = len(context.block_tables)
-    max_seqlen = context.max_seqlen
     cu_seqlens = context.cu_seqlens
+    seq_lens = context.seq_lens
+    prefix_lens = context.prefix_lens
     
-    num_q_heads = q.shape[1]
-    num_kv_heads = k.shape[1]
-    head_dim = q.shape[2]
+    outputs = []
     
-    q_padded = torch.zeros((batch_size, max_seqlen, num_q_heads, head_dim), dtype=q.dtype, device=q.device)
-    k_padded = torch.zeros((batch_size, max_seqlen, num_kv_heads, head_dim), dtype=k.dtype, device=k.device)
-    v_padded = torch.zeros((batch_size, max_seqlen, num_kv_heads, head_dim), dtype=v.dtype, device=v.device)
-    
-    
-    for i in range(batch_size):
-        start = cu_seqlens[i].item()
-        end = cu_seqlens[i+1].item()
-        seq_len = end - start
+    for seq_idx in range(batch_size):
+        start = cu_seqlens[seq_idx].item()
+        end = cu_seqlens[seq_idx+1].item()
+        
+        suffix_len = end - start
+        prefix_len = int(prefix_lens[seq_idx].item())
+        full_len = int(seq_lens[seq_idx].item())
+        
+        if suffix_len == 0:
+            continue
         
         q_seq = q[start:end]
         k_seq = k[start:end]
         v_seq = v[start:end]
         
-        q_padded[i, :seq_len] = q_seq
-        k_padded[i, :seq_len] = k_seq
-        v_padded[i, :seq_len] = v_seq
+        block_table = context.block_tables[seq_idx]
+        block_ids = block_table[block_table >= 0].tolist()
         
-        block_table = context.block_tables[i]
-        valid_block_ids = block_table[block_table >= 0].tolist()
-        kv_cache_pool.append_tokens(
+        kv_cache_pool.write_tokens(
             layer_idx=layer_idx,
-            block_ids=valid_block_ids,
-            start_pos=0,
+            block_ids=block_ids,
+            start_pos=prefix_len,
             k=k_seq,
             v=v_seq
         )
         
-    seq_lens = context.seq_lens
+        k_full, v_full = kv_cache_pool.gather_sequence(
+            layer_idx=layer_idx,
+            block_ids=block_ids,
+            seq_len=full_len
+        )
         
-    q_spda = q_padded.transpose(1, 2)
-    k_spda = k_padded.transpose(1, 2)
-    v_spda = v_padded.transpose(1, 2)
-    
-    q_pos = torch.arange(max_seqlen, device=q.device)
-    k_pos = torch.arange(max_seqlen, device=k.device)
-    
-    casual = q_pos[:, None] >= k_pos[None, :]
-    key_valid = k_pos[None, :] < seq_lens[:, None]
-    query_valid = q_pos[None, :] < seq_lens[:, None]
-    
-    attn_mask = (
-        casual.unsqueeze(0)
-        & query_valid[:, :, None]
-        & key_valid[:, None, :]
-    ).unsqueeze(1)
-    
-    out = F.scaled_dot_product_attention(
-        q_spda,
-        k_spda,
-        v_spda,
-        attn_mask=attn_mask,
-        dropout_p=0.0,
-        is_causal=False,
-        scale=scale,
-        enable_gqa=(num_q_heads != num_kv_heads),
-    )
-    
-    out = out.transpose(1, 2)
+        q_spda = q_seq.transpose(0, 1).unsqueeze(0)
+        k_spda = k_full.transpose(0, 1).unsqueeze(0)
+        v_spda = v_full.transpose(0, 1).unsqueeze(0)
         
-    outputs = []
-    for i in range(batch_size):
-        seq_len = seq_lens[i].item()
-        outputs.append(out[i, :seq_len])
+        q_abs_pos = prefix_len + torch.arange(suffix_len, device=q.device)
+        k_abs_pos = torch.arange(full_len, device=q.device)
+        attn_mask = (q_abs_pos[:, None] >= k_abs_pos[None, :]).unsqueeze(0).unsqueeze(0)
+        
+        out = F.scaled_dot_product_attention(
+            q_spda,
+            k_spda,
+            v_spda,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=scale,
+            enable_gqa=(q.shape[1] != k_full.shape[1])
+        )
+        
+        out = out.squeeze(0).transpose(0, 1)
+        outputs.append(out)
+        
+    if not outputs:
+        return torch.empty_like(q)
         
     return torch.cat(outputs, dim=0)
         
@@ -770,36 +800,31 @@ def torch_decode_spda(
     scale: float,
 ) -> torch.Tensor:
     
-    batch_size, num_q_heads, head_dim = q.shape
+    batch_size, num_q_heads, _head_dim = q.shape
     _, num_kv_heads, _ = k.shape
     
     kv_lens = context.seq_lens
     max_kv_len = int(kv_lens.max().item())
     
-    k_padded = torch.zeros(
-        (batch_size, max_kv_len, num_kv_heads, head_dim),
-        dtype=k.dtype,
-        device=k.device
-    )
-    
-    v_padded = torch.zeros_like(k_padded)
+    outputs = []
     
     for seq_idx in range(batch_size):
         cache_len = int(context.cache_lens[seq_idx].item())
         full_len = int(kv_lens[seq_idx].item())
         
+        q_seq = q[seq_idx:seq_idx+1]
+        k_seq = k[seq_idx:seq_idx+1]
+        v_seq = v[seq_idx:seq_idx+1]
+        
         block_table = context.block_tables[seq_idx]
         block_ids = block_table[block_table >= 0].tolist()
         
-        k_new = k[seq_idx:seq_idx+1]
-        v_new = v[seq_idx:seq_idx+1]
-        
-        kv_cache_pool.append_tokens(
+        kv_cache_pool.write_tokens(
             layer_idx=layer_idx,
             block_ids=block_ids,
             start_pos=cache_len,
-            k=k_new,
-            v=v_new
+            k=k_seq,
+            v=v_seq
         )
         
         k_full, v_full = kv_cache_pool.gather_sequence(
@@ -808,28 +833,25 @@ def torch_decode_spda(
             seq_len=full_len
         )
         
-        k_padded[seq_idx, :full_len] = k_full
-        v_padded[seq_idx, :full_len] = v_full
+        q_spda = q_seq.transpose(0, 1).unsqueeze(0)
+        k_spda = k_full.transpose(0, 1).unsqueeze(0)
+        v_spda = v_full.transpose(0, 1).unsqueeze(0)
         
-    q_spda = q.unsqueeze(2)
-    k_spda = k_padded.transpose(1, 2)
-    v_spda = v_padded.transpose(1, 2)
-    
-    kv_positions = torch.arange(max_kv_len, device=k.device)
-    key_valid = kv_positions[None, :] < kv_lens[:, None]
-    attn_mask = key_valid[:, None, None, :]
-    
-    out = F.scaled_dot_product_attention(
-        q_spda,
-        k_spda,
-        v_spda,
-        attn_mask=attn_mask,
-        dropout_p=0.0,
-        is_causal=False,
-        scale=scale,
-        enable_gqa=(num_q_heads != num_kv_heads),
-    )
-    
-    return out.squeeze(2)
+        out = F.scaled_dot_product_attention(
+            q_spda,
+            k_spda,
+            v_spda,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=scale,
+            enable_gqa=(num_q_heads != num_kv_heads),
+        )
+        
+        
+        out = out.squeeze(0).transpose(0, 1)
+        outputs.append(out)
+        
+    return torch.cat(outputs, dim=0)
 
 

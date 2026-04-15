@@ -10,6 +10,7 @@ class Context:
     # prefill
     cu_seqlens: torch.Tensor | None = None
     max_seqlen: int | None = None
+    prefix_lens: torch.Tensor | None = None
     
     # decode
     cache_lens: torch.Tensor | None = None

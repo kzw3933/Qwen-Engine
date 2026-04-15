@@ -4,14 +4,14 @@ from engine.executor import ModelExecutor
 from engine.sequence import Sequence, SequenceStatus
 from engine.kvcache import KVCachePool
 
-from typing import List
+from typing import List, Callable
 
 
 class LLMEngine:
-    def __init__(self, model, tokenizer, kv_cache_pool: KVCachePool, device: torch.device, mode: str = "torch"):
+    def __init__(self, model, tokenizer, kv_cache_pool: KVCachePool, max_num_seqs: int, device: torch.device, mode: str = "torch"):
         self.model = model
         self.tokenizer = tokenizer
-        self.kv_cache_pool = kv_cache_pool
+        self.max_num_seqs = max_num_seqs
         self.device = device
         self.executor = ModelExecutor(
             model=model,
@@ -20,10 +20,13 @@ class LLMEngine:
             mode=mode
         )      
         self._next_seq_id = 0
+        self.work_queue: List[Sequence] = []
+        self.finish_queue: List[Sequence] = []
     
-    def create_sequence(self, prompt_token_ids, max_new_tokens: int):
+    def create_sequence(self, prompt_text, prompt_token_ids, max_new_tokens: int):
         sequence = Sequence(
             seq_id=self._next_seq_id,
+            prompt_text=prompt_text,
             prompt_token_ids=prompt_token_ids,
             max_new_tokens=max_new_tokens
         )
@@ -52,6 +55,7 @@ class LLMEngine:
             ).input_ids[0].tolist()
                 
             sequence = self.create_sequence(
+                prompt_text=prompt_text,
                 prompt_token_ids=prompt_token_ids,
                 max_new_tokens=max_new_tokens
             )
@@ -67,41 +71,82 @@ class LLMEngine:
             output_text = self.tokenizer.decode(all_token_ids, skip_special_tokens=True)
             outputs.append(output_text)
         return outputs
-        
     
-    
-    def generate(self, prompt_texts: List[str], max_new_tokens: int = 16) -> List[str]:
+    def submit(self, prompt_texts: str | List[str], max_new_tokens: int = 16) -> None:
+        if isinstance(prompt_texts, str):
+            prompt_texts = [prompt_texts]
+        self.work_queue.extend(
+            self.encode_prompts(prompt_texts=prompt_texts, max_new_tokens=max_new_tokens)
+        )
         
-        sequences = self.encode_prompts(prompt_texts, max_new_tokens)
-            
-        try:
-            prefill_logits, prefill_context = self.executor.run_prefill(sequences)
-            
-            last_logits = self.executor.gather_prefill_last_logits(
-                prefill_logits,
-                prefill_context.cu_seqlens
-            )
-            
-            next_token_ids = self.executor.sample_next_tokens(last_logits)
-            
-            for seq, next_token_id in zip(sequences, next_token_ids):
-                seq.output_token_ids.append(next_token_id)
+        
+    def consume_sequences(self, status: SequenceStatus, max_num_seqs: int) -> List[Sequence]:
+        seqs = []
+        remaining_seqs = []
+        
+        for seq in self.work_queue:
+            if (
+                seq.status == status
+                and len(seqs) < max_num_seqs
+            ):
+                seqs.append(seq)
+            else:
+                remaining_seqs.append(seq)
                 
-            active_sequences = [seq for seq in sequences if not self.should_stop(seq)]
+        self.work_queue = remaining_seqs
+        
+        return seqs
             
-            while active_sequences:
-                decode_logits, _ = self.executor.run_decode_step(active_sequences)
-                next_token_ids = self.executor.sample_next_tokens(decode_logits)
-                
-                for seq, next_token_id in zip(active_sequences, next_token_ids):
+    
+    def serving(self, print_func: Callable) -> None:
+        
+        while self.work_queue:
+            prefill_seqs = self.consume_sequences(SequenceStatus.WAITING, self.max_num_seqs)
+            if prefill_seqs:
+                logits, context = self.executor.run_prefill(prefill_seqs)
+
+                last_logits = self.executor.gather_prefill_last_logits(
+                    logits,
+                    context.cu_seqlens
+                )
+                    
+                next_token_ids = self.executor.sample_next_tokens(last_logits)
+                    
+                for seq, next_token_id in zip(prefill_seqs, next_token_ids):
                     seq.output_token_ids.append(next_token_id)
                     
-                active_sequences = [seq for seq in active_sequences if not self.should_stop(seq)]
-
-            return self.decode_sequences(sequences)
-        finally:
-            for seq in sequences:
-                if seq.block_ids:
-                    self.kv_cache_pool.free_blocks_by_ids(seq.block_ids)
-                    seq.block_ids.clear()
+                    seq.num_computed_tokens = seq.prompt_len
+                    seq.num_kv_tokens = seq.prompt_len
+                    if self.should_stop(seq):
+                        seq.status = SequenceStatus.FINISHED
+                        self.finish_queue.append(seq)
+                    else:
+                        seq.status = SequenceStatus.PREFILLED
+                        self.work_queue.append(seq)
+                        
+            decode_seqs = self.consume_sequences(SequenceStatus.DECODING, self.max_num_seqs)
+            if len(decode_seqs) < self.max_num_seqs:
+                decode_seqs.extend(self.consume_sequences(SequenceStatus.PREFILLED, self.max_num_seqs - len(decode_seqs)))
                 
+            if decode_seqs:
+                logits = self.executor.run_decode_step(decode_seqs)
+                next_token_ids = self.executor.sample_next_tokens(logits)
+                for seq, next_token_id in zip(decode_seqs, next_token_ids):
+                    seq.output_token_ids.append(next_token_id)
+                    seq.num_computed_tokens += 1
+                    seq.num_kv_tokens += 1
+                    if self.should_stop(seq):
+                        seq.status = SequenceStatus.FINISHED
+                        self.finish_queue.append(seq)
+                    else:
+                        seq.status = SequenceStatus.DECODING
+                        self.work_queue.append(seq)
+                        
+                self.executor.register_shared_blocks(decode_seqs)
+
+        decode_texts = self.decode_sequences(self.finish_queue)   
+        for seq, decode_text in zip(self.finish_queue, decode_texts):
+            print_func(seq.prompt_text, decode_text)
+            if seq.block_ids:
+                self.executor.release_sequence(seq)
+                seq.block_ids.clear()
